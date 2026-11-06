@@ -1,0 +1,191 @@
+# Signe la fiche de version de BiblioMax, après l'approbation du responsable.
+#
+# Modèle à copier tel quel dans le dépôt PUBLIC iselr/bibliomax-telechargement, sous
+# .github/workflows/signer.yml. Ce dépôt ne contient ni code ni installateur : seulement, pour
+# chaque version, derniere-version.json et sa signature, que lisent les PC des testeurs. Les
+# installateurs restent dans le dépôt PRIVÉ iselr/bibliomax-versions.
+#
+# Lancé par la publication (workflow « Version figée » du dépôt de BiblioMax). Deux temps :
+# 1. verifier : télécharge l'installateur depuis le dépôt privé, recalcule son empreinte et sa
+#    taille, et les affiche dans le résumé ;
+# 2. signer : attend l'approbation du responsable (environnement « signature »), vérifie encore,
+#    puis signe et publie la fiche. Sans ce clic « Approve », aucun PC ne voit la version.
+#
+# Réglages du dépôt public (faits par le titulaire du compte, jamais par du code) :
+# - secret du dépôt BIBLIOMAX_LECTURE_VERSIONS : jeton en lecture seule (Contents) sur
+#   iselr/bibliomax-versions ;
+# - environnement « signature » : relecteur obligatoire = le responsable, branche main seulement,
+#   secret BIBLIOMAX_CLE_SIGNATURE = la clé privée RSA-3072 (créée par creer-cles-signature.ps1).
+name: Signer une version
+
+on:
+  repository_dispatch:
+    types: [signer]
+
+concurrency:
+  group: signature
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Le numéro arrive seulement par l'environnement, et il est contrôlé avant tout usage.
+  VERSION: ${{ github.event.client_payload.version }}
+  DEPOT_VERSIONS: iselr/bibliomax-versions
+  # Clés publiques autorisées à signer : module RSA-3072 en base64, séparés par des espaces (la
+  # clé principale, puis la clé de secours). Les mêmes que $ClesMaj dans
+  # app/outils/windows/commun.ps1. Si la liste était vide, rien ne serait signé.
+  CLES_EPINGLEES: >-
+    m1p3smK3BllqZ60NsWnMURncDM5mQHwM3KPJVd5HN6YHlwxcjhCoVYyf8a+Bg+sWHfKN1RLM/S7mUeFA34gIZuKcnCd89jp/JP/MdzCFXFLT2sM0ZX0o8v6I8vXDd+kIN23MNkXlCildt0xT+rNnCCvhA4kuKo9TXbr+VKGfmzU2Q6CHy8gf+dM5Bz5Tk0vFDy8B9WGaRLf7kanU1JoKEIrqRUt2wqKTOfgkcnsNcNp9bk0QaXfDcXZfzSlp5GdnHDwSspSRhRxPZcEobeiBvSG+nYCP3tkAC6u2CIKHA4L0DF4KgcayBlHqElf9x0Z8FoXziEdo5ftqq4IHaZkT19CRsE4pOXN9dDuY90HV8dV/PWCA7v44x2G8TZf0wP/ZXTNoTfI7ngKooscAQjrEwjVe29HrjI2XqXaAnmdqUSxKlJPxQ4eYQcSku/38tagoi4+pJ6/OPkSrGGuCcX+qu7/UcnsSrg8Hgqs2uYVq4QdOGrp8gBNx5szwd8ry1b8R
+    0RIo8WStGRpBeLxxt7jZWkXhdYkT5ySodAgz3KTT5Tr0WLse9BPSx9P4zbSxERSN27rYuFQqoKtFzzGA9qUocbZas0Tvu/hcped9uwjF5aiJk2QNtn1Ucw4VincCBiUS+N0p7gbwlOnxnIG5yn5ae/9LVKIvU8O4Y/FurDTO0cEi+cQxHWho20FOj/MTQi3ujFS76kcjk9+tsasjGz6Z+j8X2QuWhDEU3G4WRrpYQVgnzYAxSyVbm4CTrciQ1+nL4qlHdOGNCK8BfxRncWHCfrK/oDYMcLCrvWgLbniXbWvW725ogJ7K2ldOcc8l6HiWcruavA6wrnfS82grujxdyaNUs5U8sEBL/AWbmav94mGnBZux7jYtgZb0oKIgAQ+9ls0bSYL7xOXlHkTHZbTz/7bgqit1oCjogtZ8PT+fGWe2EZvzENqbtakykZBHpv//hB9KBy4bXcm+DM5CiSaI+Tkjh5zFPDv7hTe0hl/BlF/De3TLsKK6j9ACWhWnZEp/
+
+jobs:
+  verifier:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      asset_id: ${{ steps.controle.outputs.asset_id }}
+      sha256: ${{ steps.controle.outputs.sha256 }}
+      taille: ${{ steps.controle.outputs.taille }}
+      commit: ${{ steps.controle.outputs.commit }}
+    steps:
+      - name: Contrôle de l'installateur dans le dépôt privé
+        id: controle
+        env:
+          GH_TOKEN: ${{ secrets.BIBLIOMAX_LECTURE_VERSIONS }}
+          GH_PUBLIC: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,5}$ ]] || { echo "numéro de version invalide" >&2; exit 1; }
+          (( 10#${VERSION##*.} <= 65535 )) || { echo "numéro de fabrication trop grand" >&2; exit 1; }
+          [ -n "$GH_TOKEN" ] || { echo "secret BIBLIOMAX_LECTURE_VERSIONS absent" >&2; exit 1; }
+          [ -n "$CLES_EPINGLEES" ] || { echo "aucune clé publique épinglée (CLES_EPINGLEES) : rien n'est signé" >&2; exit 1; }
+
+          # Jamais deux fois la même version, jamais une version plus ancienne que la dernière signée.
+          if GH_TOKEN="$GH_PUBLIC" gh api "repos/$GITHUB_REPOSITORY/releases/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "la version $VERSION est déjà signée" >&2; exit 1
+          fi
+          derniere="$(GH_TOKEN="$GH_PUBLIC" gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          derniere="${derniere#v}"
+          if [ -n "$derniere" ]; then
+            if [ "$derniere" = "$VERSION" ] || [ "$(printf '%s\n%s\n' "$derniere" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+              echo "la version $VERSION n'est pas plus récente que la dernière signée ($derniere)" >&2; exit 1
+            fi
+          fi
+
+          dossier="$RUNNER_TEMP/version"
+          mkdir -p "$dossier"
+          exe="BiblioMax-Setup-$VERSION.exe"
+          # Un jeton en lecture ne voit pas les brouillons : la version doit être publiée dans le dépôt privé.
+          gh api "repos/$DEPOT_VERSIONS/releases/tags/v$VERSION" > "$dossier/release.json" \
+            || { echo "version v$VERSION introuvable dans le dépôt privé" >&2; exit 1; }
+          [ "$(jq -r .draft "$dossier/release.json")" = "false" ] || { echo "la version est encore un brouillon" >&2; exit 1; }
+          asset_id="$(jq -r --arg n "$exe" '[.assets[] | select(.name == $n)] | if length == 1 then .[0].id else empty end' "$dossier/release.json")"
+          [[ "$asset_id" =~ ^[1-9][0-9]{0,14}$ ]] || { echo "$exe introuvable dans le dépôt privé" >&2; exit 1; }
+          gh release download "v$VERSION" --repo "$DEPOT_VERSIONS" --dir "$dossier" \
+            --pattern "$exe" --pattern "$exe.sha256" --pattern "fabrication.json"
+
+          sha256="$(sha256sum "$dossier/$exe" | cut -d' ' -f1)"
+          taille="$(stat -c %s "$dossier/$exe")"
+          annonce="$(tr -d '\r\n' < "$dossier/$exe.sha256" | tr 'A-F' 'a-f')"
+          f="$dossier/fabrication.json"
+          [ "$annonce" = "$sha256" ] || { echo "l'empreinte de $exe.sha256 ne correspond pas au fichier" >&2; exit 1; }
+          [ "$(jq -r .sha256 "$f")" = "$sha256" ] || { echo "fabrication.json : empreinte différente" >&2; exit 1; }
+          [ "$(jq -r .taille "$f")" = "$taille" ] || { echo "fabrication.json : taille différente" >&2; exit 1; }
+          [ "$(jq -r .version "$f")" = "$VERSION" ] || { echo "fabrication.json : autre version" >&2; exit 1; }
+          commit="$(jq -r .commit "$f")"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "fabrication.json : commit invalide" >&2; exit 1; }
+          (( taille >= 52428800 && taille <= 2147483648 )) || { echo "taille inattendue ($taille octets)" >&2; exit 1; }
+
+          {
+            echo "### BiblioMax $VERSION : à comparer avant d'approuver"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Empreinte SHA-256 (début) | \`${sha256:0:16}\` |"
+            echo "| Taille | $taille octets |"
+            echo "| Commit | \`${commit:0:12}\` |"
+            echo "| Fabrication | $(jq -r .run_url "$f") |"
+            echo ""
+            echo "Ces valeurs doivent être celles du résumé de la fabrication. Sinon, refuser (« Reject »)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "asset_id=$asset_id"
+            echo "sha256=$sha256"
+            echo "taille=$taille"
+            echo "commit=$commit"
+          } >> "$GITHUB_OUTPUT"
+
+  signer:
+    needs: verifier
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: signature
+    permissions:
+      contents: write
+    steps:
+      - name: Nouvelle vérification, fiche signée
+        env:
+          GH_TOKEN: ${{ secrets.BIBLIOMAX_LECTURE_VERSIONS }}
+          CLE: ${{ secrets.BIBLIOMAX_CLE_SIGNATURE }}
+          ASSET_ID: ${{ needs.verifier.outputs.asset_id }}
+          SHA256: ${{ needs.verifier.outputs.sha256 }}
+          TAILLE: ${{ needs.verifier.outputs.taille }}
+          COMMIT: ${{ needs.verifier.outputs.commit }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,5}$ ]] || { echo "numéro de version invalide" >&2; exit 1; }
+          [[ "$ASSET_ID" =~ ^[1-9][0-9]{0,14}$ ]] || { echo "identifiant de fichier invalide" >&2; exit 1; }
+          [ -n "$CLE" ] || { echo "secret BIBLIOMAX_CLE_SIGNATURE absent de l'environnement signature" >&2; exit 1; }
+
+          # Le fichier a pu être remplacé pendant l'attente de l'approbation : on le revérifie.
+          dossier="$RUNNER_TEMP/version"
+          mkdir -p "$dossier"
+          exe="BiblioMax-Setup-$VERSION.exe"
+          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
+            -H "X-GitHub-Api-Version: 2022-11-28" -o "$dossier/$exe" \
+            "https://api.github.com/repos/$DEPOT_VERSIONS/releases/assets/$ASSET_ID"
+          [ "$(sha256sum "$dossier/$exe" | cut -d' ' -f1)" = "$SHA256" ] || { echo "le fichier a changé depuis la vérification" >&2; exit 1; }
+          [ "$(stat -c %s "$dossier/$exe")" = "$TAILLE" ] || { echo "la taille a changé depuis la vérification" >&2; exit 1; }
+
+          fiche="$RUNNER_TEMP/derniere-version.json"
+          jq -c -n --arg v "$VERSION" --arg c "$COMMIT" --arg p "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg d "$DEPOT_VERSIONS" --arg f "$exe" --arg id "$ASSET_ID" --arg t "$TAILLE" --arg s "$SHA256" \
+            '{format: 1, produit: "BiblioMax", canal: "testeurs", version: $v, commit: $c, publie_le: $p,
+              depot: $d, fichier: $f, asset_id: ($id | tonumber), taille: ($t | tonumber), sha256: $s}' > "$fiche"
+
+          umask 077
+          cle="$RUNNER_TEMP/cle.pem"
+          printf '%s\n' "$CLE" > "$cle"
+          module="$(openssl rsa -in "$cle" -noout -modulus | sed 's/^Modulus=//' | tr -d '\r\n' | basenc --base16 -d | base64 -w0)"
+          [ "$(printf '%s' "$module" | base64 -d | wc -c)" = "384" ] || { echo "la clé de signature n'est pas une clé RSA-3072" >&2; exit 1; }
+          epinglee=0
+          for m in $CLES_EPINGLEES; do [ "$m" = "$module" ] && epinglee=1; done
+          [ "$epinglee" = 1 ] || { echo "la clé de signature n'est pas l'une des clés épinglées dans les PC" >&2; exit 1; }
+          openssl dgst -sha256 -sign "$cle" -out "$fiche.sig" "$fiche"
+          openssl rsa -in "$cle" -pubout -out "$RUNNER_TEMP/publique.pem" 2>/dev/null
+          rm -f "$cle"
+          openssl dgst -sha256 -verify "$RUNNER_TEMP/publique.pem" -signature "$fiche.sig" "$fiche"
+          [ "$(stat -c %s "$fiche.sig")" = "384" ] || { echo "signature de taille inattendue" >&2; exit 1; }
+          cat "$fiche"
+      - name: Effacement de la clé
+        if: always()
+        run: rm -f "$RUNNER_TEMP/cle.pem"
+      - name: Publication de la fiche signée
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          fiche="$RUNNER_TEMP/derniere-version.json"
+          gh release create "v$VERSION" "$fiche" "$fiche.sig" --repo "$GITHUB_REPOSITORY" \
+            --title "BiblioMax $VERSION" --latest \
+            --notes "Fiche signée de la version $VERSION, lue par les PC des testeurs. L'installateur n'est pas ici : il reste dans le dépôt privé des versions."
+          # Les PC lisent releases/latest/download : on attend que GitHub y serve cette version.
+          for i in $(seq 1 30); do
+            lue="$(curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/derniere-version.json" | jq -r .version 2>/dev/null || true)"
+            if [ "$lue" = "$VERSION" ]; then echo "Version $VERSION proposée aux PC des testeurs."; exit 0; fi
+            sleep 10
+          done
+          echo "GitHub ne sert pas encore la nouvelle fiche" >&2
+          exit 1
