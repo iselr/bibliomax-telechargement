@@ -66,7 +66,14 @@ jobs:
           if GH_TOKEN="$GH_PUBLIC" gh api "repos/$GITHUB_REPOSITORY/releases/tags/v$VERSION" >/dev/null 2>&1; then
             echo "la version $VERSION est déjà signée" >&2; exit 1
           fi
-          derniere="$(GH_TOKEN="$GH_PUBLIC" gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          # Avant la toute première signature, ce dépôt n'a aucune version : GitHub répond 404.
+          # Toute autre erreur arrête la signature (gh écrit aussi le corps de l'erreur sur la sortie).
+          derniere=""
+          if reponse="$(GH_TOKEN="$GH_PUBLIC" gh api "repos/$GITHUB_REPOSITORY/releases/latest" 2>&1)"; then
+            derniere="$(jq -r '.tag_name // ""' <<< "$reponse")"
+          elif ! grep -qE 'HTTP 404|"status": ?"404"' <<< "$reponse"; then
+            echo "dernière version signée illisible : $reponse" >&2; exit 1
+          fi
           derniere="${derniere#v}"
           if [ -n "$derniere" ]; then
             if [ "$derniere" = "$VERSION" ] || [ "$(printf '%s\n%s\n' "$derniere" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
